@@ -17,11 +17,16 @@ def norm_str(v) -> str:
         return ""
     return str(v).strip()
 
+# Positive / Negative token sets (case-insensitive)
+POS_TOKENS = {"yes", "y", "true", "1", "pass", "passed", "success", "ok"}
+NEG_TOKENS = {"no", "n", "false", "0", "fail", "failed", "na", "n/a", "not applicable", "none", ""}
+
 def is_yes(v: str) -> bool:
-    return norm_str(v).lower() in {"yes", "y", "true", "1"}
+    return norm_str(v).lower() in POS_TOKENS
 
 def is_no(v: str) -> bool:
-    return norm_str(v).lower() in {"no", "n", "false", "0"}
+    s = norm_str(v).lower()
+    return s in NEG_TOKENS
 
 def is_na(v: str) -> bool:
     return norm_str(v).lower() in {"na", "n/a", "not applicable", "none", ""}
@@ -65,17 +70,21 @@ def detect_kind_from_key(key: str) -> str:
     if "newrelic" in k or "new_relic" in k: return "newrelic"
     return "newrelic"
 
+def non_id_columns(row: pd.Series, id_col: str) -> List[str]:
+    return [c for c in row.index if c != id_col]
+
+# --- Robust ID matching (always compare normalized strings) ---
+def norm_id_series(s: pd.Series) -> pd.Series:
+    return s.astype(str).map(lambda x: str(x).strip())
+
 def first_row_for_id(df: pd.DataFrame, id_col: str, id_val):
     try:
-        sub = df.loc[df[id_col] == id_val]
+        sub = df.loc[norm_id_series(df[id_col]) == str(id_val).strip()]
         if not sub.empty:
             return sub.iloc[0]
     except Exception:
         pass
     return None
-
-def non_id_columns(row: pd.Series, id_col: str) -> List[str]:
-    return [c for c in row.index if c != id_col]
 
 # ----------------- Scoring -----------------
 def score_producer(value) -> str:
@@ -84,25 +93,27 @@ def score_producer(value) -> str:
     return "Fail"
 
 def score_consumer(applicable, posted) -> str:
-    if is_no(applicable): return "NA"
-    if is_yes(applicable) and is_yes(posted): return "Pass"
-    if is_failed_pattern(applicable) or is_failed_pattern(posted): return "Fail"
+    # Treat NA/No as NA (still counts as Fail in final result)
+    if is_no(applicable) or is_na(applicable):
+        return "NA"
+    if is_yes(applicable) and is_yes(posted):
+        return "Pass"
+    if is_failed_pattern(applicable) or is_failed_pattern(posted):
+        return "Fail"
     return "Fail"
 
 def score_comparator_classic_value(val) -> str:
     s = norm_str(val).lower()
-    if s == "yes": return "Pass"
+    if s in POS_TOKENS: return "Pass"
     if s in {"na", "n/a", "missing"}: return "NA"
-    if s == "no" or is_failed_pattern(s): return "Fail"
+    if s in NEG_TOKENS or is_failed_pattern(s): return "Fail"
     return "Fail"
 
 def score_comparator_json_status(status_val) -> str:
     s = norm_str(status_val).lower()
-    pass_tokens = {"yes","y","true","1","pass","passed","success","ok"}
-    fail_tokens = {"no","n","false","0","fail","failed","error",""}
-    if s in pass_tokens: return "Pass"
-    if s in fail_tokens or is_failed_pattern(s): return "Fail"
-    return "Fail"  # conservative
+    if s in POS_TOKENS: return "Pass"
+    if s in NEG_TOKENS or is_failed_pattern(s): return "Fail"
+    return "Fail"
 
 def score_all_yes(row: pd.Series, id_col: str) -> str:
     for c in non_id_columns(row, id_col):
@@ -110,13 +121,26 @@ def score_all_yes(row: pd.Series, id_col: str) -> str:
             return "Fail"
     return "Pass"
 
-# --- Reason extraction: ONLY explicit reasons present in fields ---
+# --- New Relic specific: ignore non-flag text columns like File_Name ---
+def _is_flag_value(v: str) -> bool:
+    s = norm_str(v).lower()
+    return s in POS_TOKENS or s in NEG_TOKENS or is_failed_pattern(s)
+
+def score_newrelic_row(row: pd.Series, id_col: str) -> str:
+    saw_flag = False
+    for c in non_id_columns(row, id_col):
+        s = norm_str(row[c]).lower()
+        if not _is_flag_value(s):
+            # ignore non-flag text columns (e.g., File_Name)
+            continue
+        saw_flag = True
+        if (s in NEG_TOKENS) or is_failed_pattern(s):
+            return "Fail"
+    # if no flag-like columns found, be conservative
+    return "Pass" if saw_flag else "Fail"
+
+# --- Only explicit reasons from field values ---
 def maybe_reason_from_value(value: str) -> Optional[str]:
-    """
-    Return a reason string only if the cell contains an explicit failure reason,
-    e.g., 'failed-str{...}', 'error...', 'exception...'.
-    Otherwise return None (no reason appended).
-    """
     s = norm_str(value)
     if not s:
         return None
@@ -141,7 +165,7 @@ def consolidate(cfg_path: Path) -> Path:
     id_col = pick_id_col(list(df_prod.columns))
     if not id_col:
         raise SystemExit("Could not detect Tracking/Invoice column in producer file")
-    invoices = df_prod[id_col].dropna().astype(str).map(str).tolist()
+    invoices = norm_id_series(df_prod[id_col]).tolist()
 
     # Producer status col
     prod_status_cols = [c for c in df_prod.columns if c.lower().startswith("posted_to_producer_topic")]
@@ -169,11 +193,9 @@ def consolidate(cfg_path: Path) -> Path:
         prod_row = first_row_for_id(df_prod, id_col, inv)
         if prod_row is None:
             row["producer"] = "Fail"
-            # NO diagnostic reason appended
         else:
             val = prod_row[prod_status_col] if (prod_status_col and prod_status_col in prod_row.index) else None
             row["producer"] = score_producer(val)
-            # Append explicit reason only if value itself carries one
             rtxt = maybe_reason_from_value(val)
             if rtxt:
                 reasons.setdefault("producer", []).append(f"Posted_To_Producer_Topic?={rtxt}")
@@ -186,13 +208,11 @@ def consolidate(cfg_path: Path) -> Path:
 
             if df is None or not invc or invc not in (df.columns if df is not None else []):
                 row[key] = "Fail"
-                # NO diagnostic reason appended
                 continue
 
-            sub = df.loc[df[invc] == inv] if df is not None else pd.DataFrame()
+            sub = df.loc[norm_id_series(df[invc]) == inv] if df is not None else pd.DataFrame()
             if sub.empty:
                 row[key] = "Fail"
-                # NO diagnostic reason appended
                 continue
 
             r = sub.iloc[0]
@@ -204,7 +224,6 @@ def consolidate(cfg_path: Path) -> Path:
                 post_val = r[post_col] if post_col else None
                 status = score_consumer(app_val, post_val)
                 row[key] = status
-                # Only append explicit reasons
                 for col_name, cell in (("Applicable", app_val), ("Posted", post_val)):
                     rr = maybe_reason_from_value(cell)
                     if rr:
@@ -220,7 +239,6 @@ def consolidate(cfg_path: Path) -> Path:
                     if rr:
                         reasons.setdefault(key, []).append(f"{cmp_col}={rr}")
                 else:
-                    # Fallback: all non-ID columns must be Yes
                     status = score_all_yes(r, invc)
                     row[key] = status
                     if status != "Pass":
@@ -230,24 +248,20 @@ def consolidate(cfg_path: Path) -> Path:
                                 reasons.setdefault(key, []).append(f"{c}={rr}")
 
             elif kind == "json_comparator":
-                # Prefer Status/Reason if present
                 status_col = next((c for c in r.index if c.lower() == "status"), None)
                 reason_col = next((c for c in r.index if c.lower() == "reason"), None)
                 if status_col:
                     status_val = r[status_col]
                     status = score_comparator_json_status(status_val)
                     row[key] = status
-                    # reason from Status if it's a failed-* or error-like
                     rr = maybe_reason_from_value(status_val)
                     if rr:
                         reasons.setdefault(key, []).append(f"{status_col}={rr}")
-                    # reason column text (always include if non-empty and row failed)
                     if status != "Pass" and reason_col:
                         reason_text = norm_str(r[reason_col])
                         if reason_text:
                             reasons.setdefault(key, []).append(f"{reason_col}={reason_text}")
                 else:
-                    # Fallback: all non-ID columns must be Yes
                     status = score_all_yes(r, invc)
                     row[key] = status
                     if status != "Pass":
@@ -266,9 +280,10 @@ def consolidate(cfg_path: Path) -> Path:
                     reasons.setdefault(key, []).append(f"{pcol or 'Posted_To_Producer_Topic?'}={rr}")
 
             else:  # newrelic-like
-                status = score_all_yes(r, invc)
+                status = score_newrelic_row(r, invc)
                 row[key] = status
                 if status != "Pass":
+                    # Only add explicit failure-text reasons
                     for c in non_id_columns(r, invc):
                         rr = maybe_reason_from_value(r[c])
                         if rr:
@@ -279,9 +294,7 @@ def consolidate(cfg_path: Path) -> Path:
         final_pass = all(str(row[c]).strip() == "Pass" for c in per_cols)
         row["Final Result"] = "Pass" if final_pass else "Fail"
 
-        # Reason column (only explicit reasons we collected)
         row["Reason"] = "; ".join(f"{k}=[{', '.join(v)}]" for k, v in reasons.items()) if reasons else ""
-
         rows.append(row)
 
     # Output
@@ -297,7 +310,7 @@ def consolidate(cfg_path: Path) -> Path:
     return out_path
 
 def main():
-    ap = argparse.ArgumentParser(description="Report Maker Consolidated (explicit reasons only)")
+    ap = argparse.ArgumentParser(description="Report Maker Consolidated (robust IDs + normalized flags)")
     ap.add_argument("--config", help="Path to config JSON (defaults to ${ROOT_PATH}/config.json)")
     args = ap.parse_args()
 

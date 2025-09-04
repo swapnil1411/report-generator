@@ -1,7 +1,7 @@
 {
   "producer": "${ROOT_PATH}/giftcard_producer.xlsx",
   "files": {
-    "giftcard_consumer": "${ROOT_PATH}/giftcard_producer.xlsx",
+    "giftcard_consumer": "${ROOT_PATH}/giftcard_consumer.xlsx",
     "giftcard_comparator": "${ROOT_PATH}/giftcard_comparator.xlsx",
     "giftcard_newrelic": "${ROOT_PATH}/giftcard_newrelic.xlsx",
     "mirakl_order_newrelic": "${ROOT_PATH}/mirakl_order_newrelic.xlsx",
