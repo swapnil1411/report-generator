@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 import json
+import os
 from pathlib import Path
 from typing import Dict, List, Optional
 import argparse
 import pandas as pd
 
-
-config="${ROOT_PATH}/config.json"
 # ----------------- Helpers -----------------
+def expand_env_str(s: str) -> str:
+    """Expand ${ROOT_PATH}, ~, and other env vars in paths."""
+    root_path = os.getenv("ROOT_PATH", ".")
+    s = s.replace("${ROOT_PATH}", root_path)
+    return os.path.expanduser(os.path.expandvars(s))
+
 def norm_str(v) -> str:
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
@@ -105,11 +110,13 @@ def score_newrelic_row(row: pd.Series, id_col: str) -> str:
 
 # ----------------- Main consolidate -----------------
 def consolidate(cfg_path: Path) -> Path:
-    cfg = json.loads(cfg_path.read_text())
+    cfg_text = Path(cfg_path).read_text()
+    cfg_text = expand_env_str(cfg_text)
+    cfg = json.loads(cfg_text)
 
-    prod_path = Path(cfg["producer"]).expanduser()
-    files_map: Dict[str, str] = cfg.get("files", {})
-    out_dir = Path(cfg.get("output") or ".").expanduser()
+    prod_path = Path(expand_env_str(cfg["producer"]))
+    files_map: Dict[str, str] = {k: expand_env_str(v) for k, v in cfg.get("files", {}).items()}
+    out_dir = Path(expand_env_str(cfg.get("output") or "."))
 
     # Producer for IDs
     df_prod = read_excel(prod_path)
@@ -130,7 +137,7 @@ def consolidate(cfg_path: Path) -> Path:
     id_cols: Dict[str, Optional[str]] = {}
     kinds: Dict[str, str] = {}
     for key in keys_in_order:
-        p = Path(files_map[key]).expanduser()
+        p = Path(files_map[key])
         df = read_excel(p)
         dfs[key] = df
         id_cols[key] = pick_id_col(list(df.columns)) if df is not None else None
@@ -211,7 +218,7 @@ def consolidate(cfg_path: Path) -> Path:
                 status = score_newrelic_row(r, invc)
                 row[key] = status
                 if status != "Pass":
-                    # enumerate non-ID columns and capture exact values (including failed-*)
+                    # enumerate non-ID columns and capture exact values
                     for c in r.index:
                         if c == invc:
                             continue
@@ -224,7 +231,7 @@ def consolidate(cfg_path: Path) -> Path:
         final_pass = all(str(row[c]).strip() == "Pass" for c in per_cols)
         row["Final Result"] = "Pass" if final_pass else "Fail"
 
-        # Reason column: compact per-file list
+        # Reason column
         if reasons:
             parts = []
             for k in per_cols:
@@ -250,10 +257,13 @@ def consolidate(cfg_path: Path) -> Path:
     return out_path
 
 def main():
-    ap = argparse.ArgumentParser(description="Report Maker Consolidated (single-sheet with Reason column)")
-    ap.add_argument("--config", required=True, help="Path to config JSON")
+    ap = argparse.ArgumentParser(description="Report Maker Consolidated (ROOT_PATH aware)")
+    ap.add_argument("--config", help="Path to config JSON (optional, defaults to ${ROOT_PATH}/config.json)")
     args = ap.parse_args()
-    consolidate(Path(args.config).expanduser())
+
+    root_path = os.getenv("ROOT_PATH", ".")
+    cfg_path = Path(args.config if args.config else f"{root_path}/config.json")
+    consolidate(cfg_path)
 
 if __name__ == "__main__":
     main()
