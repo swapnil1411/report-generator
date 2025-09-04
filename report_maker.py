@@ -8,7 +8,6 @@ import pandas as pd
 
 # ----------------- Helpers -----------------
 def expand_env_str(s: str) -> str:
-    """Expand ${ROOT_PATH}, ~, and other env vars in paths."""
     root_path = os.getenv("ROOT_PATH", ".")
     s = s.replace("${ROOT_PATH}", root_path)
     return os.path.expanduser(os.path.expandvars(s))
@@ -45,30 +44,25 @@ def read_excel(path: Path) -> Optional[pd.DataFrame]:
 
 def pick_id_col(cols: List[str]) -> Optional[str]:
     preferred = [
-        "Tracking_ID_OR_Unique_Key",
-        "Tracking_ID",
-        "Unique_Key",
-        "Invoice No.",
-        "Invoice_No",
-        "Invoice",
-        "Tracking ID",
+        "Tracking_ID_OR_Unique_Key","Tracking_ID","Unique_Key",
+        "Invoice No.","Invoice_No","Invoice","Tracking ID",
     ]
     exact = {c.strip(): c for c in cols}
     for p in preferred:
-        if p in exact:
-            return exact[p]
+        if p in exact: return exact[p]
     for c in cols:
         cl = c.lower().replace("_", " ")
         if "invoice" in cl or "tracking" in cl or "unique" in cl:
             return c
     return None
 
-def detect_kind(key: str, path: str) -> str:
-    s = f"{key} {path}".lower()
-    if "producer" in s: return "producer"
-    if "consumer" in s: return "consumer"
-    if "comparator" in s: return "comparator"
-    if "newrelic" in s or "new_relic" in s: return "newrelic"
+def detect_kind_from_key(key: str) -> str:
+    k = key.lower()
+    if "json_comparator" in k: return "json_comparator"
+    if "comparator" in k: return "comparator"
+    if "producer" in k: return "producer"
+    if "consumer" in k: return "consumer"
+    if "newrelic" in k or "new_relic" in k: return "newrelic"
     return "newrelic"
 
 def first_row_for_id(df: pd.DataFrame, id_col: str, id_val):
@@ -79,6 +73,9 @@ def first_row_for_id(df: pd.DataFrame, id_col: str, id_val):
     except Exception:
         pass
     return None
+
+def non_id_columns(row: pd.Series, id_col: str) -> List[str]:
+    return [c for c in row.index if c != id_col]
 
 # ----------------- Scoring -----------------
 def score_producer(value) -> str:
@@ -92,21 +89,40 @@ def score_consumer(applicable, posted) -> str:
     if is_failed_pattern(applicable) or is_failed_pattern(posted): return "Fail"
     return "Fail"
 
-def score_comparator(val) -> str:
+def score_comparator_classic_value(val) -> str:
     s = norm_str(val).lower()
     if s == "yes": return "Pass"
     if s in {"na", "n/a", "missing"}: return "NA"
     if s == "no" or is_failed_pattern(s): return "Fail"
     return "Fail"
 
-def score_newrelic_row(row: pd.Series, id_col: str) -> str:
-    # Pass only if all non-ID columns are strictly "Yes"
-    for c in row.index:
-        if c == id_col:
-            continue
+def score_comparator_json_status(status_val) -> str:
+    s = norm_str(status_val).lower()
+    pass_tokens = {"yes","y","true","1","pass","passed","success","ok"}
+    fail_tokens = {"no","n","false","0","fail","failed","error",""}
+    if s in pass_tokens: return "Pass"
+    if s in fail_tokens or is_failed_pattern(s): return "Fail"
+    return "Fail"  # conservative
+
+def score_all_yes(row: pd.Series, id_col: str) -> str:
+    for c in non_id_columns(row, id_col):
         if not is_yes(row[c]):
             return "Fail"
     return "Pass"
+
+# --- Reason extraction: ONLY explicit reasons present in fields ---
+def maybe_reason_from_value(value: str) -> Optional[str]:
+    """
+    Return a reason string only if the cell contains an explicit failure reason,
+    e.g., 'failed-str{...}', 'error...', 'exception...'.
+    Otherwise return None (no reason appended).
+    """
+    s = norm_str(value)
+    if not s:
+        return None
+    if is_failed_pattern(s):
+        return s
+    return None
 
 # ----------------- Main consolidate -----------------
 def consolidate(cfg_path: Path) -> Path:
@@ -141,7 +157,7 @@ def consolidate(cfg_path: Path) -> Path:
         df = read_excel(p)
         dfs[key] = df
         id_cols[key] = pick_id_col(list(df.columns)) if df is not None else None
-        kinds[key] = detect_kind(key, str(p))
+        kinds[key] = detect_kind_from_key(key)
 
     # Build rows
     rows = []
@@ -149,102 +165,126 @@ def consolidate(cfg_path: Path) -> Path:
         row = {"Invoice No.": inv}
         reasons: Dict[str, List[str]] = {}
 
-        # Producer column first
+        # Producer
         prod_row = first_row_for_id(df_prod, id_col, inv)
         if prod_row is None:
             row["producer"] = "Fail"
-            reasons.setdefault("producer", []).append("invoice_not_found")
+            # NO diagnostic reason appended
         else:
             val = prod_row[prod_status_col] if (prod_status_col and prod_status_col in prod_row.index) else None
             row["producer"] = score_producer(val)
-            if row["producer"] != "Pass":
-                reasons.setdefault("producer", []).append(f"Posted_To_Producer_Topic?={norm_str(val) or 'NA'}")
+            # Append explicit reason only if value itself carries one
+            rtxt = maybe_reason_from_value(val)
+            if rtxt:
+                reasons.setdefault("producer", []).append(f"Posted_To_Producer_Topic?={rtxt}")
 
-        # Then configured files in order
+        # Other files
         for key in keys_in_order:
             df = dfs.get(key)
             kind = kinds.get(key, "newrelic")
             invc = id_cols.get(key)
 
-            if df is None:
+            if df is None or not invc or invc not in (df.columns if df is not None else []):
                 row[key] = "Fail"
-                reasons.setdefault(key, []).append("file_unreadable_or_missing")
+                # NO diagnostic reason appended
                 continue
 
-            if not invc or invc not in df.columns:
-                row[key] = "Fail"
-                reasons.setdefault(key, []).append("id_column_not_found")
-                continue
-
-            sub = df.loc[df[invc] == inv]
+            sub = df.loc[df[invc] == inv] if df is not None else pd.DataFrame()
             if sub.empty:
                 row[key] = "Fail"
-                reasons.setdefault(key, []).append("invoice_not_found")
+                # NO diagnostic reason appended
                 continue
 
             r = sub.iloc[0]
+
             if kind == "consumer":
-                app_cols = [c for c in df.columns if c.lower().startswith("applicable_for_consumer_topic")]
-                post_cols = [c for c in df.columns if c.lower().startswith("posted_to_consumer_topic")]
-                app_col = app_cols[0] if app_cols else None
-                post_col = post_cols[0] if post_cols else None
-                app_val = r[app_col] if (app_col and app_col in r.index) else None
-                post_val = r[post_col] if (post_col and post_col in r.index) else None
+                app_col = next((c for c in r.index if "applicable_for_consumer_topic" in c.lower()), None)
+                post_col = next((c for c in r.index if "posted_to_consumer_topic" in c.lower()), None)
+                app_val = r[app_col] if app_col else None
+                post_val = r[post_col] if post_col else None
                 status = score_consumer(app_val, post_val)
                 row[key] = status
-                if status != "Pass":
-                    reasons.setdefault(key, []).append(f"Applicable={norm_str(app_val) or 'NA'}")
-                    reasons.setdefault(key, []).append(f"Posted={norm_str(post_val) or 'NA'}")
+                # Only append explicit reasons
+                for col_name, cell in (("Applicable", app_val), ("Posted", post_val)):
+                    rr = maybe_reason_from_value(cell)
+                    if rr:
+                        reasons.setdefault(key, []).append(f"{col_name}={rr}")
 
             elif kind == "comparator":
-                comp_cols = [c for c in df.columns if "expected" in c.lower() and "observed" in c.lower() and "match" in c.lower()]
-                comp_col = comp_cols[0] if comp_cols else None
-                v = r[comp_col] if (comp_col and comp_col in r.index) else None
-                status = score_comparator(v)
-                row[key] = status
-                if status != "Pass":
-                    reasons.setdefault(key, []).append(f"{comp_col or 'Expected_vs_Observed'}={norm_str(v) or 'NA'}")
+                cmp_col = next((c for c in r.index if "expected" in c.lower() and "observed" in c.lower() and "match" in c.lower()), None)
+                if cmp_col:
+                    v = r[cmp_col]
+                    status = score_comparator_classic_value(v)
+                    row[key] = status
+                    rr = maybe_reason_from_value(v)
+                    if rr:
+                        reasons.setdefault(key, []).append(f"{cmp_col}={rr}")
+                else:
+                    # Fallback: all non-ID columns must be Yes
+                    status = score_all_yes(r, invc)
+                    row[key] = status
+                    if status != "Pass":
+                        for c in non_id_columns(r, invc):
+                            rr = maybe_reason_from_value(r[c])
+                            if rr:
+                                reasons.setdefault(key, []).append(f"{c}={rr}")
+
+            elif kind == "json_comparator":
+                # Prefer Status/Reason if present
+                status_col = next((c for c in r.index if c.lower() == "status"), None)
+                reason_col = next((c for c in r.index if c.lower() == "reason"), None)
+                if status_col:
+                    status_val = r[status_col]
+                    status = score_comparator_json_status(status_val)
+                    row[key] = status
+                    # reason from Status if it's a failed-* or error-like
+                    rr = maybe_reason_from_value(status_val)
+                    if rr:
+                        reasons.setdefault(key, []).append(f"{status_col}={rr}")
+                    # reason column text (always include if non-empty and row failed)
+                    if status != "Pass" and reason_col:
+                        reason_text = norm_str(r[reason_col])
+                        if reason_text:
+                            reasons.setdefault(key, []).append(f"{reason_col}={reason_text}")
+                else:
+                    # Fallback: all non-ID columns must be Yes
+                    status = score_all_yes(r, invc)
+                    row[key] = status
+                    if status != "Pass":
+                        for c in non_id_columns(r, invc):
+                            rr = maybe_reason_from_value(r[c])
+                            if rr:
+                                reasons.setdefault(key, []).append(f"{c}={rr}")
 
             elif kind == "producer":
-                pcols = [c for c in df.columns if c.lower().startswith("posted_to_producer_topic")]
-                pcol = pcols[0] if pcols else None
-                val2 = r[pcol] if (pcol and pcol in r.index) else None
+                pcol = next((c for c in r.index if c.lower().startswith("posted_to_producer_topic")), None)
+                val2 = r[pcol] if pcol else None
                 status = score_producer(val2)
                 row[key] = status
-                if status != "Pass":
-                    reasons.setdefault(key, []).append(f"Posted_To_Producer_Topic?={norm_str(val2) or 'NA'}")
+                rr = maybe_reason_from_value(val2)
+                if rr:
+                    reasons.setdefault(key, []).append(f"{pcol or 'Posted_To_Producer_Topic?'}={rr}")
 
-            else:  # newrelic / unknown
-                status = score_newrelic_row(r, invc)
+            else:  # newrelic-like
+                status = score_all_yes(r, invc)
                 row[key] = status
                 if status != "Pass":
-                    # enumerate non-ID columns and capture exact values
-                    for c in r.index:
-                        if c == invc:
-                            continue
-                        valx = r[c]
-                        if not is_yes(valx):
-                            reasons.setdefault(key, []).append(f"{c}={norm_str(valx) or 'NA'}")
+                    for c in non_id_columns(r, invc):
+                        rr = maybe_reason_from_value(r[c])
+                        if rr:
+                            reasons.setdefault(key, []).append(f"{c}={rr}")
 
-        # Final Result
-        per_cols = [c for c in list(row.keys()) if c != "Invoice No."]
+        # Final Result (NA still counts as Fail)
+        per_cols = [c for c in row.keys() if c != "Invoice No."]
         final_pass = all(str(row[c]).strip() == "Pass" for c in per_cols)
         row["Final Result"] = "Pass" if final_pass else "Fail"
 
-        # Reason column
-        if reasons:
-            parts = []
-            for k in per_cols:
-                if k in reasons and reasons[k]:
-                    items = ", ".join(reasons[k])
-                    parts.append(f"{k}=[{items}]")
-            row["Reason"] = "; ".join(parts)
-        else:
-            row["Reason"] = ""
+        # Reason column (only explicit reasons we collected)
+        row["Reason"] = "; ".join(f"{k}=[{', '.join(v)}]" for k, v in reasons.items()) if reasons else ""
 
         rows.append(row)
 
-    # DataFrame with columns in order
+    # Output
     columns = ["Invoice No.", "producer"] + keys_in_order + ["Final Result", "Reason"]
     final_df = pd.DataFrame(rows)[columns]
 
@@ -257,8 +297,8 @@ def consolidate(cfg_path: Path) -> Path:
     return out_path
 
 def main():
-    ap = argparse.ArgumentParser(description="Report Maker Consolidated (ROOT_PATH aware)")
-    ap.add_argument("--config", help="Path to config JSON (optional, defaults to ${ROOT_PATH}/config.json)")
+    ap = argparse.ArgumentParser(description="Report Maker Consolidated (explicit reasons only)")
+    ap.add_argument("--config", help="Path to config JSON (defaults to ${ROOT_PATH}/config.json)")
     args = ap.parse_args()
 
     root_path = os.getenv("ROOT_PATH", ".")

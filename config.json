@@ -5,7 +5,8 @@
     "giftcard_comparator": "${ROOT_PATH}/giftcard_comparator.xlsx",
     "giftcard_newrelic": "${ROOT_PATH}/giftcard_newrelic.xlsx",
     "mirakl_order_newrelic": "${ROOT_PATH}/mirakl_order_newrelic.xlsx",
-    "mirakl_refund_newrelic": "${ROOT_PATH}/mirakl_refund_newrelic.xlsx"
+    "mirakl_refund_newrelic": "${ROOT_PATH}/mirakl_refund_newrelic.xlsx",
+    "giftcard_json_comparator": "${ROOT_PATH}/json_comparator_with_producer_ids.xlsx"
   },
   "output": "${ROOT_PATH}/"
 }
