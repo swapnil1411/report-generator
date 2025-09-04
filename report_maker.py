@@ -1,230 +1,259 @@
 #!/usr/bin/env python3
-"""
-report_maker.py — FINAL per-column report (plus Producer sheet) with scan logs.
-
-Excel output:
-  • Sheet "Producer": Invoice No., Producer, Fail Reason
-  • Sheet "Final"   : Invoice No., Mirakl Order, Mirakl Refund, Vertex,
-                      IP - US, IP - UK, PIX, Fail Reason
-
-Config json supports ${ROOT_PATH} and ~.
-Expected headers in each file (exact spellings):
-  Producer.xlsx                -> ['Invoice No.', 'Producer', 'Fail Reason']
-  Mirakl_NewRelic.xlsx         -> ['Invoice No.', 'Mirakl Order', 'Mirakl Refund', 'Fail Reason']
-  JSON_Comparator.xlsx         -> ['Invoice No.', 'Mirakl Order', 'Mirakl Refund', 'Fail Reason']
-  Vertex_Consumer.xlsx         -> ['Invoice No.', 'Vertex Consumer', 'Fail Reason']
-  IP_US_Consumer.xlsx          -> ['Invoice No.', 'IP-US Consumer', 'Fail Reason']
-  IP_UK_Consumer.xlsx          -> ['Invoice No.', 'IP-UK Consumer', 'Fail Reason']
-  PIX_Consumer.xlsx            -> ['Invoice No.', 'PIX Consumer', 'Fail Reason']
-  Vertex_File_Comparator.xlsx  -> ['Invoice No.', 'Vertex', 'Fail Reason']
-  IP_File_Comparator.xlsx      -> ['Invoice No.', 'IP-US', 'IP-UK', 'Fail Reason']
-  PIX_XML_Comparator.xlsx      -> ['Invoice No.', 'PIX', 'Fail Reason']
-"""
-
-from __future__ import annotations
-import argparse, json, os
+import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
+import argparse
 import pandas as pd
 
-# ---- mapping: which source file/column feed each FINAL column ----
-FINAL_GROUPS = {
-    "Mirakl Order": [("Mirakl_NewRelic", "Mirakl Order"),
-                     ("JSON_Comparator", "Mirakl Order")],
-    "Mirakl Refund": [("Mirakl_NewRelic", "Mirakl Refund"),
-                      ("JSON_Comparator", "Mirakl Refund")],
-    "Vertex": [("Vertex_Consumer", "Vertex Consumer"),
-               ("Vertex_File_Comparator", "Vertex")],
-    "IP - US": [("IP_US_Consumer", "IP-US Consumer"),
-                ("IP_File_Comparator", "IP-US")],
-    "IP - UK": [("IP_UK_Consumer", "IP-UK Consumer"),
-                ("IP_File_Comparator", "IP-UK")],
-    "PIX": [("PIX_Consumer", "PIX Consumer"),
-            ("PIX_XML_Comparator", "PIX")],
-}
-FINAL_ORDER = ["Invoice No.", "Mirakl Order", "Mirakl Refund", "Vertex", "IP - US", "IP - UK", "PIX", "Fail Reason"]
 
-# ---------------- config + utils ----------------
-def expand_env_str(s: str) -> str:
-    return os.path.expanduser(os.path.expandvars(s))
+config="${ROOT_PATH}/config.json"
+# ----------------- Helpers -----------------
+def norm_str(v) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    return str(v).strip()
 
-def expand_env_deep(obj):
-    if isinstance(obj, dict):  return {k: expand_env_deep(v) for k, v in obj.items()}
-    if isinstance(obj, list):  return [expand_env_deep(v) for v in obj]
-    if isinstance(obj, str):   return expand_env_str(obj)
-    return obj
+def is_yes(v: str) -> bool:
+    return norm_str(v).lower() in {"yes", "y", "true", "1"}
 
-def load_config(path: Path) -> dict:
-    print(f"[CONFIG] Using: {path}", flush=True)
-    cfg = json.loads(Path(path).read_text())
-    for k, v in cfg.get("env", {}).items():
-        os.environ[str(k)] = expand_env_str(str(v))
-        print(f"[ENV] {k}={os.environ[str(k)]}", flush=True)
-    return expand_env_deep(cfg)
+def is_no(v: str) -> bool:
+    return norm_str(v).lower() in {"no", "n", "false", "0"}
 
-def _norm_status(val: Optional[str]) -> str:
-    if val is None: return "NA"
-    s = str(val).strip().lower()
-    if s in {"pass","passed","ok","success"}: return "Pass"
-    if s in {"fail","failed","error","ko"}:   return "Fail"
-    if s in {"","na","n/a","none","null"}:    return "NA"
-    return "NA"
+def is_na(v: str) -> bool:
+    return norm_str(v).lower() in {"na", "n/a", "not applicable", "none", ""}
 
-def _load_df(p: Path) -> Optional[pd.DataFrame]:
-    if not p.exists():
-        print(f"[SCAN] MISSING: {p}", flush=True)
+def is_failed_pattern(v: str) -> bool:
+    s = norm_str(v).lower()
+    return s.startswith("failed-") or s.startswith("fail-") or s.startswith("error") or s.startswith("exception")
+
+def read_excel(path: Path) -> Optional[pd.DataFrame]:
+    if not path.exists():
+        print(f"[WARN] Missing file: {path}")
         return None
     try:
-        df = pd.read_excel(p) if p.suffix.lower() in {".xlsx",".xls"} else pd.read_csv(p)
-        print(f"[SCAN] LOADED : {p} (rows={len(df)}, cols={len(df.columns)})", flush=True)
+        df = pd.read_excel(path)
+        df.columns = [str(c).strip() for c in df.columns]
         return df
     except Exception as e:
-        print(f"[SCAN] ERROR  : {p} ({type(e).__name__}: {e})", flush=True)
+        print(f"[ERROR] Failed to read {path}: {e}")
         return None
 
-def _load_datasets(cfg: dict) -> Dict[str, Optional[pd.DataFrame]]:
-    out = {}
-    for key, file_path in cfg.get("datasets", {}).items():
-        p = Path(file_path)
-        print(f"[SCAN] {key} -> {p}", flush=True)
-        out[key] = _load_df(p)
-    return out
+def pick_id_col(cols: List[str]) -> Optional[str]:
+    preferred = [
+        "Tracking_ID_OR_Unique_Key",
+        "Tracking_ID",
+        "Unique_Key",
+        "Invoice No.",
+        "Invoice_No",
+        "Invoice",
+        "Tracking ID",
+    ]
+    exact = {c.strip(): c for c in cols}
+    for p in preferred:
+        if p in exact:
+            return exact[p]
+    for c in cols:
+        cl = c.lower().replace("_", " ")
+        if "invoice" in cl or "tracking" in cl or "unique" in cl:
+            return c
+    return None
 
-def _lookup(df: pd.DataFrame, invoice: str, status_col: str) -> Tuple[Optional[str], Optional[str]]:
-    if df is None or "Invoice No." not in df.columns: return None, None
-    m = df[df["Invoice No."].astype(str) == str(invoice)]
-    if m.empty: return None, None
-    row = m.iloc[0]
-    return (None if pd.isna(row.get(status_col)) else str(row.get(status_col)),
-            None if pd.isna(row.get("Fail Reason")) else str(row.get("Fail Reason")))
+def detect_kind(key: str, path: str) -> str:
+    s = f"{key} {path}".lower()
+    if "producer" in s: return "producer"
+    if "consumer" in s: return "consumer"
+    if "comparator" in s: return "comparator"
+    if "newrelic" in s or "new_relic" in s: return "newrelic"
+    return "newrelic"
 
-def _derive_invoices(cfg: dict, datasets: Dict[str, Optional[pd.DataFrame]]) -> List[str]:
-    ds_cfg = cfg.get("datasets", {})
-    if not ds_cfg: raise SystemExit("No datasets configured.")
-    source_key = "Producer" if "Producer" in ds_cfg else next(iter(ds_cfg))
-    df = datasets.get(source_key)
-    if df is None: raise SystemExit(f"Dataset '{source_key}' could not be loaded.")
-    if "Invoice No." not in df.columns: raise SystemExit(f"Dataset '{source_key}' missing 'Invoice No.'")
-    seen, invs = set(), []
-    for v in df["Invoice No."]:
-        if pd.isna(v): continue
-        s = str(v)
-        if s not in seen:
-            seen.add(s); invs.append(s)
-    print(f"[INVOICES] Using {len(invs)} from {source_key}", flush=True)
-    return invs
+def first_row_for_id(df: pd.DataFrame, id_col: str, id_val):
+    try:
+        sub = df.loc[df[id_col] == id_val]
+        if not sub.empty:
+            return sub.iloc[0]
+    except Exception:
+        pass
+    return None
 
-def _summarize_missing(datasets: Dict[str, Optional[pd.DataFrame]], invoices: List[str]):
-    for name, df in datasets.items():
-        if df is None: print(f"[MISS] {name}: file not loaded", flush=True); continue
-        if "Invoice No." not in df.columns: print(f"[MISS] {name}: no 'Invoice No.' column", flush=True); continue
-        have = set(str(x) for x in df["Invoice No."].dropna().astype(str))
-        miss = [inv for inv in invoices if inv not in have]
-        if miss: print(f"[MISS] {name}: missing {len(miss)} -> {', '.join(miss)}", flush=True)
-        else:    print(f"[OK]   {name}: all {len(invoices)} invoices present", flush=True)
+# ----------------- Scoring -----------------
+def score_producer(value) -> str:
+    if is_yes(value): return "Pass"
+    if is_failed_pattern(value) or is_no(value) or is_na(value) or norm_str(value) == "": return "Fail"
+    return "Fail"
 
-# --------------- build sheets ---------------
-def build_producer_sheet(invoices: List[str], producer_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+def score_consumer(applicable, posted) -> str:
+    if is_no(applicable): return "NA"
+    if is_yes(applicable) and is_yes(posted): return "Pass"
+    if is_failed_pattern(applicable) or is_failed_pattern(posted): return "Fail"
+    return "Fail"
+
+def score_comparator(val) -> str:
+    s = norm_str(val).lower()
+    if s == "yes": return "Pass"
+    if s in {"na", "n/a", "missing"}: return "NA"
+    if s == "no" or is_failed_pattern(s): return "Fail"
+    return "Fail"
+
+def score_newrelic_row(row: pd.Series, id_col: str) -> str:
+    # Pass only if all non-ID columns are strictly "Yes"
+    for c in row.index:
+        if c == id_col:
+            continue
+        if not is_yes(row[c]):
+            return "Fail"
+    return "Pass"
+
+# ----------------- Main consolidate -----------------
+def consolidate(cfg_path: Path) -> Path:
+    cfg = json.loads(cfg_path.read_text())
+
+    prod_path = Path(cfg["producer"]).expanduser()
+    files_map: Dict[str, str] = cfg.get("files", {})
+    out_dir = Path(cfg.get("output") or ".").expanduser()
+
+    # Producer for IDs
+    df_prod = read_excel(prod_path)
+    if df_prod is None:
+        raise SystemExit(f"Producer file not found or unreadable: {prod_path}")
+    id_col = pick_id_col(list(df_prod.columns))
+    if not id_col:
+        raise SystemExit("Could not detect Tracking/Invoice column in producer file")
+    invoices = df_prod[id_col].dropna().astype(str).map(str).tolist()
+
+    # Producer status col
+    prod_status_cols = [c for c in df_prod.columns if c.lower().startswith("posted_to_producer_topic")]
+    prod_status_col = prod_status_cols[0] if prod_status_cols else None
+
+    # Preload other files in config order
+    keys_in_order = list(files_map.keys())
+    dfs: Dict[str, Optional[pd.DataFrame]] = {}
+    id_cols: Dict[str, Optional[str]] = {}
+    kinds: Dict[str, str] = {}
+    for key in keys_in_order:
+        p = Path(files_map[key]).expanduser()
+        df = read_excel(p)
+        dfs[key] = df
+        id_cols[key] = pick_id_col(list(df.columns)) if df is not None else None
+        kinds[key] = detect_kind(key, str(p))
+
+    # Build rows
     rows = []
     for inv in invoices:
-        if producer_df is None or "Invoice No." not in producer_df.columns:
-            rows.append({"Invoice No.": inv, "Producer": "Fail", "Fail Reason": "[Producer] file not loaded or schema mismatch"})
-            continue
-        m = producer_df[producer_df["Invoice No."].astype(str) == str(inv)]
-        if m.empty:
-            rows.append({"Invoice No.": inv, "Producer": "Fail", "Fail Reason": f"[Producer] Missing invoice {inv}"})
+        row = {"Invoice No.": inv}
+        reasons: Dict[str, List[str]] = {}
+
+        # Producer column first
+        prod_row = first_row_for_id(df_prod, id_col, inv)
+        if prod_row is None:
+            row["producer"] = "Fail"
+            reasons.setdefault("producer", []).append("invoice_not_found")
         else:
-            r = m.iloc[0]
-            s = _norm_status(r.get("Producer"))
-            reason = str(r.get("Fail Reason")) if (s == "Fail" and str(r.get("Fail Reason")).strip()) else ""
-            rows.append({"Invoice No.": inv, "Producer": s, "Fail Reason": reason})
-    return pd.DataFrame(rows, columns=["Invoice No.", "Producer", "Fail Reason"])
+            val = prod_row[prod_status_col] if (prod_status_col and prod_status_col in prod_row.index) else None
+            row["producer"] = score_producer(val)
+            if row["producer"] != "Pass":
+                reasons.setdefault("producer", []).append(f"Posted_To_Producer_Topic?={norm_str(val) or 'NA'}")
 
-def build_final_sheet(invoices: List[str], datasets: Dict[str, Optional[pd.DataFrame]]) -> pd.DataFrame:
-    out_rows = []
-    for inv in invoices:
-        row = {c: "" for c in FINAL_ORDER}
-        row["Invoice No."] = inv
-        reasons: List[str] = []
+        # Then configured files in order
+        for key in keys_in_order:
+            df = dfs.get(key)
+            kind = kinds.get(key, "newrelic")
+            invc = id_cols.get(key)
 
-        for final_col, providers in FINAL_GROUPS.items():
-            all_present = True
-            all_pass = True
-            all_na = True
-            for ds_name, status_col in providers:
-                status_raw, fail_raw = _lookup(datasets.get(ds_name), inv, status_col)
-                if status_raw is None:
-                    all_present = False
-                    all_pass = False
-                    all_na = False
-                    reasons.append(f"[{ds_name}] Missing invoice {inv}")
-                    continue
-                status = _norm_status(status_raw)
-                if status != "Pass": all_pass = False
-                if status != "NA":   all_na = False
-                if status == "Fail":
-                    if fail_raw and str(fail_raw).strip():
-                        reasons.append(f"[{ds_name}] {fail_raw}")
-                    else:
-                        reasons.append(f"[{ds_name}] {status_col}: Fail")
+            if df is None:
+                row[key] = "Fail"
+                reasons.setdefault(key, []).append("file_unreadable_or_missing")
+                continue
 
-            # decide final status for the column
-            if not all_present:
-                col_status = "Fail"
-            elif all_pass:
-                col_status = "Pass"
-            elif all_na:
-                col_status = "NA"
-            else:
-                col_status = "Fail"
-            row[final_col] = col_status
+            if not invc or invc not in df.columns:
+                row[key] = "Fail"
+                reasons.setdefault(key, []).append("id_column_not_found")
+                continue
 
-        # de-dup reasons keep order
+            sub = df.loc[df[invc] == inv]
+            if sub.empty:
+                row[key] = "Fail"
+                reasons.setdefault(key, []).append("invoice_not_found")
+                continue
+
+            r = sub.iloc[0]
+            if kind == "consumer":
+                app_cols = [c for c in df.columns if c.lower().startswith("applicable_for_consumer_topic")]
+                post_cols = [c for c in df.columns if c.lower().startswith("posted_to_consumer_topic")]
+                app_col = app_cols[0] if app_cols else None
+                post_col = post_cols[0] if post_cols else None
+                app_val = r[app_col] if (app_col and app_col in r.index) else None
+                post_val = r[post_col] if (post_col and post_col in r.index) else None
+                status = score_consumer(app_val, post_val)
+                row[key] = status
+                if status != "Pass":
+                    reasons.setdefault(key, []).append(f"Applicable={norm_str(app_val) or 'NA'}")
+                    reasons.setdefault(key, []).append(f"Posted={norm_str(post_val) or 'NA'}")
+
+            elif kind == "comparator":
+                comp_cols = [c for c in df.columns if "expected" in c.lower() and "observed" in c.lower() and "match" in c.lower()]
+                comp_col = comp_cols[0] if comp_cols else None
+                v = r[comp_col] if (comp_col and comp_col in r.index) else None
+                status = score_comparator(v)
+                row[key] = status
+                if status != "Pass":
+                    reasons.setdefault(key, []).append(f"{comp_col or 'Expected_vs_Observed'}={norm_str(v) or 'NA'}")
+
+            elif kind == "producer":
+                pcols = [c for c in df.columns if c.lower().startswith("posted_to_producer_topic")]
+                pcol = pcols[0] if pcols else None
+                val2 = r[pcol] if (pcol and pcol in r.index) else None
+                status = score_producer(val2)
+                row[key] = status
+                if status != "Pass":
+                    reasons.setdefault(key, []).append(f"Posted_To_Producer_Topic?={norm_str(val2) or 'NA'}")
+
+            else:  # newrelic / unknown
+                status = score_newrelic_row(r, invc)
+                row[key] = status
+                if status != "Pass":
+                    # enumerate non-ID columns and capture exact values (including failed-*)
+                    for c in r.index:
+                        if c == invc:
+                            continue
+                        valx = r[c]
+                        if not is_yes(valx):
+                            reasons.setdefault(key, []).append(f"{c}={norm_str(valx) or 'NA'}")
+
+        # Final Result
+        per_cols = [c for c in list(row.keys()) if c != "Invoice No."]
+        final_pass = all(str(row[c]).strip() == "Pass" for c in per_cols)
+        row["Final Result"] = "Pass" if final_pass else "Fail"
+
+        # Reason column: compact per-file list
         if reasons:
-            seen = set(); uniq = []
-            for r in reasons:
-                if r not in seen:
-                    seen.add(r); uniq.append(r)
-            row["Fail Reason"] = ", ".join(uniq)
-        out_rows.append(row)
+            parts = []
+            for k in per_cols:
+                if k in reasons and reasons[k]:
+                    items = ", ".join(reasons[k])
+                    parts.append(f"{k}=[{items}]")
+            row["Reason"] = "; ".join(parts)
+        else:
+            row["Reason"] = ""
 
-    return pd.DataFrame(out_rows, columns=FINAL_ORDER)
+        rows.append(row)
 
-# --------------- main ---------------
+    # DataFrame with columns in order
+    columns = ["Invoice No.", "producer"] + keys_in_order + ["Final Result", "Reason"]
+    final_df = pd.DataFrame(rows)[columns]
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "consolidated_report.xlsx"
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        final_df.to_excel(writer, index=False, sheet_name="Consolidated")
+
+    print(str(out_path))
+    return out_path
+
 def main():
-    ap = argparse.ArgumentParser(description="Final per-column report (plus Producer sheet).")
-    ap.add_argument("--config", required=True, help="Path to config.json")
-    ap.add_argument("--invoice", action="append", help="Invoice No. (repeatable). If omitted, derive from Producer/first dataset.")
-    ap.add_argument("--excel", default=None, help="Excel output path override")
+    ap = argparse.ArgumentParser(description="Report Maker Consolidated (single-sheet with Reason column)")
+    ap.add_argument("--config", required=True, help="Path to config JSON")
     args = ap.parse_args()
-
-    cfg = load_config(Path(args.config))
-    datasets = _load_datasets(cfg)
-
-    invoices = args.invoice if args.invoice else _derive_invoices(cfg, datasets)
-    _summarize_missing(datasets, invoices)
-
-    producer_df = datasets.get("Producer")
-    producer_sheet = build_producer_sheet(invoices, producer_df)
-    final_sheet    = build_final_sheet(invoices, datasets)
-
-    excel_out = args.excel or cfg.get("output", {}).get("excel")
-    if not excel_out:
-        base = Path(args.config).parent
-        excel_out = str(base / f"report_{invoices[0]}.xlsx")
-
-    p = Path(excel_out); p.parent.mkdir(parents=True, exist_ok=True)
-    for eng in ("xlsxwriter","openpyxl"):
-        try:
-            with pd.ExcelWriter(p, engine=eng) as w:
-                producer_sheet.to_excel(w, sheet_name="Producer", index=False)
-                final_sheet.to_excel(w, sheet_name="Final", index=False)
-            print(f"[WRITE] Excel: {p}", flush=True)
-            break
-        except Exception as e:
-            print(f"[WRITE] Excel engine error ({eng}): {e}", flush=True)
-
-    print("Done.", flush=True)
+    consolidate(Path(args.config).expanduser())
 
 if __name__ == "__main__":
     main()
