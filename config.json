@@ -1,12 +1,13 @@
 {
-  "producer": "${ROOT_PATH}/giftcard_producer.xlsx",
+  "producer": "${ROOT_PATH}/data/giftcard_producer.xlsx",
   "files": {
-    "giftcard_consumer": "${ROOT_PATH}/giftcard_consumer.xlsx",
-    "giftcard_comparator": "${ROOT_PATH}/giftcard_comparator.xlsx",
-    "giftcard_newrelic": "${ROOT_PATH}/giftcard_newrelic.xlsx",
-    "mirakl_order_newrelic": "${ROOT_PATH}/mirakl_order_newrelic.xlsx",
-    "mirakl_refund_newrelic": "${ROOT_PATH}/mirakl_refund_newrelic.xlsx",
-    "giftcard_json_comparator": "${ROOT_PATH}/json_comparator_with_producer_ids.xlsx"
+    "giftcard_consumer": "${ROOT_PATH}/data/giftcard_consumer.xlsx",
+    "giftcard_comparator": "${ROOT_PATH}/data/giftcard_comparator.xlsx",
+    "giftcard_newrelic": "${ROOT_PATH}/data/giftcard_newrelic.xlsx",
+    "mirakl_order_newrelic": "${ROOT_PATH}/data/mirakl_order_newrelic.xlsx",
+    "mirakl_refund_newrelic": "${ROOT_PATH}/data/mirakl_refund_newrelic.xlsx",
+    "giftcard_json_comparator": "${ROOT_PATH}/data/json_comparator_with_producer_ids.xlsx",
+    "giftcard_file_comparator": "${ROOT_PATH}/data/giftcard_comparator.xlsx"
   },
-  "output": "${ROOT_PATH}/"
+  "output": "${ROOT_PATH}/output"
 }
