@@ -1,13 +1,18 @@
 {
   "producer": "${ROOT_PATH}/data/giftcard_producer.xlsx",
   "files": {
-    "giftcard_consumer": "${ROOT_PATH}/data/giftcard_consumer.xlsx",
-    "giftcard_comparator": "${ROOT_PATH}/data/giftcard_comparator.xlsx",
-    "giftcard_newrelic": "${ROOT_PATH}/data/giftcard_newrelic.xlsx",
     "mirakl_order_newrelic": "${ROOT_PATH}/data/mirakl_order_newrelic.xlsx",
     "mirakl_refund_newrelic": "${ROOT_PATH}/data/mirakl_refund_newrelic.xlsx",
+    "vertex_consumer": "${ROOT_PATH}/data/giftcard_consumer.xlsx",
+    "IP_US_consumer": "${ROOT_PATH}/data/giftcard_consumer.xlsx",
+    "IP_UK_consumer": "${ROOT_PATH}/data/giftcard_consumer.xlsx",
+    "PIX_consumer": "${ROOT_PATH}/data/giftcard_consumer.xlsx",
     "giftcard_json_comparator": "${ROOT_PATH}/data/json_comparator_with_producer_ids.xlsx",
-    "giftcard_file_comparator": "${ROOT_PATH}/data/giftcard_comparator.xlsx"
+    "vertex_file_comparator": "${ROOT_PATH}/data/comparator.xlsx",
+    "IP_file_comparator": "${ROOT_PATH}/data/comparator.xlsx",
+    "pix_xml_comparator": "${ROOT_PATH}/data/giftcard_comparator.xlsx"
+    
+   
   },
   "output": "${ROOT_PATH}/output"
 }

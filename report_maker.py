@@ -1,33 +1,34 @@
 #!/usr/bin/env python3
 import json
 import os
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import re
 import argparse
 import pandas as pd
 
-# ----------------- Helpers -----------------
-def expand_env_str(s: str) -> str:
-    root_path = os.getenv("ROOT_PATH", ".")
-    s = s.replace("${ROOT_PATH}", root_path)
-    return os.path.expanduser(os.path.expandvars(s))
+# --- unified local + GCS I/O (your helper) ---
+from gcs_utils import (
+    expand_env_str,      # expands ${ROOT_PATH}, env vars, ~ (works with gs:// too)
+    read_text_any,       # read text from local or gs://
+    read_excel_any,      # read excel from local or gs://
+    write_excel_any,     # write excel to local or gs://
+)
 
+# ----------------- Helpers -----------------
 def norm_str(v) -> str:
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
     return str(v).strip()
 
-# Positive / Negative token sets (case-insensitive)
-POS_TOKENS = {"yes", "y", "true", "1", "pass", "passed", "success", "ok"}
+# Token sets (we always lowercase inputs before testing)
+POS_TOKENS = {"yes", "y", "true", "1", "pass", "passed", "success", "ok", "Pass"}
 NEG_TOKENS = {"no", "n", "false", "0", "fail", "failed", "na", "n/a", "not applicable", "none", ""}
 
 def is_yes(v: str) -> bool:
     return norm_str(v).lower() in POS_TOKENS
 
 def is_no(v: str) -> bool:
-    s = norm_str(v).lower()
-    return s in NEG_TOKENS
+    return norm_str(v).lower() in NEG_TOKENS
 
 def is_na(v: str) -> bool:
     return norm_str(v).lower() in {"na", "n/a", "not applicable", "none", ""}
@@ -35,24 +36,6 @@ def is_na(v: str) -> bool:
 def is_failed_pattern(v: str) -> bool:
     s = norm_str(v).lower()
     return s.startswith("failed-") or s.startswith("fail-") or s.startswith("error") or s.startswith("exception")
-
-def read_excel(path: Path) -> Optional[pd.DataFrame]:
-    if not path.exists():
-        print(f"[WARN] Missing file: {path}")
-        return None
-    try:
-        df = pd.read_excel(path, engine="openpyxl")
-        df.columns = [str(c).strip() for c in df.columns]
-        return df
-    except Exception as e:
-        print(f"[ERROR] Failed to read {path}: {e}")
-        return None
-
-def write_report(df: pd.DataFrame, out_path: Path) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Report")
-    print(str(out_path))
 
 def pick_id_col(cols: List[str]) -> Optional[str]:
     preferred = [
@@ -71,7 +54,7 @@ def pick_id_col(cols: List[str]) -> Optional[str]:
 def detect_kind_from_key(key: str) -> str:
     k = key.lower()
     if "file_comparator" in k or ("file" in k and "comparator" in k):
-        return "file_comparator"  # NEW: dedicated kind, handled like json_comparator
+        return "json_comparator"  # treat file comparator like json comparator (Status/Reason)
     if "json_comparator" in k:
         return "json_comparator"
     if "comparator" in k:
@@ -91,15 +74,6 @@ def non_id_columns(row: pd.Series, id_col: str) -> List[str]:
 def norm_id_series(s: pd.Series) -> pd.Series:
     return s.astype(str).map(lambda x: str(x).strip())
 
-def first_row_for_id(df: pd.DataFrame, id_col: str, id_val) -> Optional[pd.Series]:
-    try:
-        sub = df.loc[norm_id_series(df[id_col]) == str(id_val).strip()]
-        if not sub.empty:
-            return sub.iloc[0]
-    except Exception:
-        pass
-    return None
-
 # ----------------- Scoring -----------------
 def score_producer(value) -> str:
     if is_yes(value): return "Pass"
@@ -107,8 +81,9 @@ def score_producer(value) -> str:
     return "Fail"
 
 def score_consumer(applicable, posted) -> str:
+    # Consider NA/No as failing for consolidated (you asked for strict Pass-only)
     if is_no(applicable) or is_na(applicable):
-        return "NA"
+        return "Fail"
     if is_yes(applicable) and is_yes(posted):
         return "Pass"
     if is_failed_pattern(applicable) or is_failed_pattern(posted):
@@ -118,7 +93,6 @@ def score_consumer(applicable, posted) -> str:
 def score_comparator_classic_value(val) -> str:
     s = norm_str(val).lower()
     if s in POS_TOKENS: return "Pass"
-    if s in {"na", "n/a", "missing"}: return "NA"
     if s in NEG_TOKENS or is_failed_pattern(s): return "Fail"
     return "Fail"
 
@@ -171,7 +145,7 @@ def maybe_reason_from_value(value: str) -> Optional[str]:
         return raw
     return None
 
-# ----------------- Row evaluation per kind -----------------
+# ----------------- Per-row evaluation -----------------
 def eval_row_for_kind(kind: str, row: Optional[pd.Series], id_col: Optional[str]) -> Tuple[str, List[str]]:
     reasons: List[str] = []
     if row is None or id_col is None:
@@ -215,10 +189,8 @@ def eval_row_for_kind(kind: str, row: Optional[pd.Series], id_col: Optional[str]
                         reasons.append(f"{c}={rr}")
         return (status, reasons)
 
-    if kind in {"json_comparator", "file_comparator"}:   # NEW: handle file_comparator the same way
-        # Prefer strict 'Status' / 'Reason' columns (case-insensitive)
+    if kind == "json_comparator":
         status_col = next((c for c in row.index if c.lower() == "status"), None)
-        # accept 'reason', 'details', or 'diff' for extra context, in that priority
         reason_col = next((c for c in row.index if c.lower() in {"reason", "details", "diff"}), None)
         if status_col:
             status_val = row[status_col]
@@ -226,14 +198,13 @@ def eval_row_for_kind(kind: str, row: Optional[pd.Series], id_col: Optional[str]
             rr = maybe_reason_from_value(status_val)
             if rr:
                 reasons.append(f"{status_col}={rr}")
-            if status != "Pass" and reason_col:
+            if status != "Passed" and reason_col:
                 reason_text = norm_str(row[reason_col])
                 if reason_text:
                     reasons.append(f"{reason_col}={reason_text}")
         else:
-            # fall back to "all flags must be positive"
             status = score_all_yes(row, id_col)
-            if status != "Pass":
+            if status != "Passed":
                 for c in non_id_columns(row, id_col):
                     rr = maybe_reason_from_value(row[c])
                     if rr:
@@ -249,109 +220,130 @@ def eval_row_for_kind(kind: str, row: Optional[pd.Series], id_col: Optional[str]
                 reasons.append(f"{c}={rr}")
     return (status, reasons)
 
-# ----------------- Build one report -----------------
-def build_report_for_file(
-    key: str,
-    path_str: str,
-    kind: str,
-    df_file: Optional[pd.DataFrame],
+# ----------------- Consolidated builder -----------------
+def build_consolidated(
     prod_df: pd.DataFrame,
-    prod_id_col: str,
-    out_dir: Path,
-) -> None:
-    report_rows: List[Dict[str, str]] = []
-    file_read_ok = df_file is not None
-    file_id_col = pick_id_col(list(df_file.columns)) if df_file is not None else None
-
-    file_df = df_file if df_file is not None else pd.DataFrame()
-    if file_read_ok and file_id_col:
-        file_df = file_df.assign(__norm_id__=norm_id_series(file_df[file_id_col])).set_index("__norm_id__", drop=True)
-
-    for _, prow in prod_df.iterrows():
-        inv = str(prow[prod_id_col]).strip()
-        reason_list: List[str] = []
-        status: str = "Fail"
-
-        file_row: Optional[pd.Series] = None
-        if not file_read_ok:
-            reason_list.append("File missing or unreadable")
-        elif not file_id_col:
-            reason_list.append("ID column not found")
-        else:
-            file_row = file_df.loc[file_df.index == inv]
-            if file_row is not None and not isinstance(file_row, pd.Series) and not file_row.empty:
-                file_row = file_row.iloc[0]
-            if file_row is None or (not isinstance(file_row, pd.Series)):
-                reason_list.append(f"Invoice {inv} missing in {key}")
-
-        if file_row is not None and isinstance(file_row, pd.Series):
-            st, rs = eval_row_for_kind(kind, file_row, file_id_col)
-            status = st
-            reason_list.extend(rs)
-        else:
-            status = "Fail"
-
-        report_rows.append({
-            "Invoice No.": inv,
-            "Status": status,
-            "Reason": "; ".join(reason_list) if reason_list else "",
-        })
-
-    out_path = out_dir / f"{key}_report.xlsx"
-    write_report(pd.DataFrame(report_rows, columns=["Invoice No.", "Status", "Reason"]), out_path)
-
-# ----------------- Main -----------------
-def main():
-    ap = argparse.ArgumentParser(description="Make individual reports per file (producer keyed)")
-    ap.add_argument("--config", help="Path to config JSON (defaults to ${ROOT_PATH}/config.json)")
-    args = ap.parse_args()
-
-    root_path = os.getenv("ROOT_PATH", ".")
-    cfg_path = Path(args.config if args.config else f"{root_path}/config.json")
-
-    cfg_text = cfg_path.read_text(encoding="utf-8")
-    cfg_text = expand_env_str(cfg_text)
-    cfg = json.loads(cfg_text)
-
-    prod_path = Path(expand_env_str(cfg["producer"]))
-    files_map: Dict[str, str] = {k: expand_env_str(v) for k, v in cfg.get("files", {}).items()}
-    out_dir = Path(expand_env_str(cfg.get("output") or "."))
-
-    df_prod = read_excel(prod_path)
-    if df_prod is None:
-        raise SystemExit(f"Producer file not found or unreadable: {prod_path}")
-    prod_id_col = pick_id_col(list(df_prod.columns))
+    files_map: Dict[str, str],
+    dfs_by_key: Dict[str, Optional[pd.DataFrame]],
+) -> pd.DataFrame:
+    """
+    Returns a single consolidated DataFrame across all files.
+    Columns: Invoice No., producer, <file1>, <file2>, ..., Final Result, Reason
+    """
+    prod_id_col = pick_id_col(list(prod_df.columns))
     if not prod_id_col:
         raise SystemExit("Could not detect Tracking/Invoice column in producer file")
 
-    # Producer-only report
-    prod_rows: List[Dict[str, str]] = []
-    p_status_col = next((c for c in df_prod.columns if c.lower().startswith("posted_to_producer_topic")), None)
-    for _, prow in df_prod.iterrows():
-        inv = str(prow[prod_id_col]).strip()
-        val = prow[p_status_col] if (p_status_col and p_status_col in prow.index) else None
-        status = score_producer(val)
-        reason = maybe_reason_from_value(val)
-        prod_rows.append({
-            "Invoice No.": inv,
-            "Status": status,
-            "Reason": (f"{p_status_col or 'Posted_To_Producer_Topic?'}={reason}" if reason else "")
-        })
-    write_report(pd.DataFrame(prod_rows, columns=["Invoice No.", "Status", "Reason"]), out_dir / "producer_report.xlsx")
+    # Pre-index all file DFs by normalized ID for fast lookup
+    indexed: Dict[str, Tuple[str, Optional[pd.DataFrame]]] = {}  # key -> (id_col, df_indexed_or_None)
+    kinds: Dict[str, str] = {}
+    for key, df in dfs_by_key.items():
+        kinds[key] = detect_kind_from_key(key)
+        if df is not None:
+            fid = pick_id_col(list(df.columns))
+            if fid:
+                idx = df.assign(__norm_id__=norm_id_series(df[fid])).set_index("__norm_id__", drop=True)
+                indexed[key] = (fid, idx)
+            else:
+                indexed[key] = (None, None)
+        else:
+            indexed[key] = (None, None)
 
-    # Per-file reports
-    for key, pstr in files_map.items():
-        kind = detect_kind_from_key(key)
-        df_f = read_excel(Path(pstr))
-        build_report_for_file(
-            key=key,
-            path_str=pstr,
-            kind=kind,
-            df_file=df_f,
-            prod_df=df_prod,
-            prod_id_col=prod_id_col,
-            out_dir=out_dir,
-        )
+    # Build rows
+    keys_in_order = list(files_map.keys())
+    rows: List[Dict[str, str]] = []
+
+    # detect producer status column once
+    p_status_col = next((c for c in prod_df.columns if c.lower().startswith("posted_to_producer_topic")), None)
+
+    for _, prow in prod_df.iterrows():
+        inv = str(prow[prod_id_col]).strip()
+        row: Dict[str, str] = {"Invoice No.": inv}
+        reasons_by_key: Dict[str, List[str]] = {}
+
+        # Producer status
+        pval = prow[p_status_col] if (p_status_col and p_status_col in prow.index) else None
+        pstatus = score_producer(pval)
+        row["producer"] = pstatus
+        pr = maybe_reason_from_value(pval)
+        if pr:
+            reasons_by_key.setdefault("producer", []).append(f"{p_status_col or 'Posted_To_Producer_Topic?'}={pr}")
+
+        # Each configured file
+        for key in keys_in_order:
+            fid, fidx = indexed.get(key, (None, None))
+            kind = kinds.get(key, "newrelic")
+
+            status = "Fail"
+            reasons: List[str] = []
+
+            if fidx is None or fid is None:
+                # file missing or ID col not found OR df was None
+                if dfs_by_key.get(key) is None:
+                    reasons.append("File missing or unreadable")
+                else:
+                    reasons.append("ID column not found")
+            else:
+                sub = fidx.loc[fidx.index == inv]
+                if sub is not None and not isinstance(sub, pd.Series) and not sub.empty:
+                    sub = sub.iloc[0]
+                if sub is None or not isinstance(sub, pd.Series):
+                    reasons.append(f"Invoice {inv} missing in {key}")
+                else:
+                    status, rs = eval_row_for_kind(kind, sub, fid)
+                    reasons.extend(rs)
+
+            row[key] = status
+            if reasons:
+                reasons_by_key.setdefault(key, []).extend(reasons)
+
+        # Final result: strict Pass-only across all status columns
+        per_cols = ["producer"] + keys_in_order
+        final_pass = all(str(row[c]).strip() == "Pass" for c in per_cols)
+        row["Final Result"] = "Pass" if final_pass else "Fail"
+
+        # Aggregate reasons into one column (key=[r1, r2; ...])
+        if reasons_by_key:
+            reason_chunks = []
+            for k, arr in reasons_by_key.items():
+                reason_chunks.append(f"{k}=[{'; '.join(arr)}]")
+            row["Reason"] = "; ".join(reason_chunks)
+        else:
+            row["Reason"] = ""
+
+        rows.append(row)
+
+    columns = ["Invoice No.", "producer"] + keys_in_order + ["Final Result", "Reason"]
+    return pd.DataFrame(rows)[columns]
+
+# ----------------- Main -----------------
+def main():
+    ap = argparse.ArgumentParser(description="Consolidated report across all files (local or gs://)")
+    ap.add_argument("--config", help="Path to config JSON (defaults to ${ROOT_PATH}/config.json)")
+    args = ap.parse_args()
+
+    cfg_path = expand_env_str(args.config if args.config else "${ROOT_PATH}/config.json")
+    cfg = json.loads(read_text_any(cfg_path))
+
+    prod_path = expand_env_str(cfg["producer"])
+    files_map: Dict[str, str] = {k: expand_env_str(v) for k, v in cfg.get("files", {}).items()}
+    out_dir = expand_env_str(cfg.get("output") or ".")
+    out_path = out_dir.rstrip("/") + "/consolidated_report.xlsx"
+
+    # Load producer
+    df_prod = read_excel_any(prod_path)
+    if df_prod is None:
+        raise SystemExit(f"Producer file not found or unreadable: {prod_path}")
+
+    # Load all other files (local or gs://)
+    dfs_by_key: Dict[str, Optional[pd.DataFrame]] = {}
+    for key, p in files_map.items():
+        dfs_by_key[key] = read_excel_any(p)
+
+    # Build consolidated and write
+    final_df = build_consolidated(df_prod, files_map, dfs_by_key)
+    write_excel_any({"Consolidated": final_df}, out_path)
+    print(out_path)
 
 if __name__ == "__main__":
     main()
